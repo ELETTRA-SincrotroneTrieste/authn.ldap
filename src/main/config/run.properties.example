@@ -19,6 +19,13 @@ security_principal = %@fed.cclrc.ac.uk
 !ldap.filter = (&(CN=%)(objectclass=user))
 !ldap.attribute = name
 
+# To search for the user before authenticating, provide a service account.
+# The search must return exactly one entry. Its DN will be used to authenticate
+# the user, while ldap.attribute controls the user name returned to ICAT.
+# Keep the credentials secret and restrict access to this file.
+!presearch.security_principal = uid=ldap-operator,ou=services,dc=example,dc=org
+!presearch.security_credentials = change-me
+
 # To force the case to be all lower
 case = lower
 

@@ -16,6 +16,7 @@ import javax.naming.AuthenticationException;
 import javax.naming.Context;
 import javax.naming.NamingEnumeration;
 import javax.naming.NamingException;
+import javax.naming.directory.Attribute;
 import javax.naming.directory.SearchControls;
 import javax.naming.directory.SearchResult;
 import javax.naming.ldap.InitialLdapContext;
@@ -48,6 +49,7 @@ public class LDAP_Authenticator {
 
 	private static final Logger logger = LoggerFactory.getLogger(LDAP_Authenticator.class);
 	private static final Marker fatal = MarkerFactory.getMarker("FATAL");
+	private static final String AUTHENTICATION_FAILED = "The username and password do not match ";
 
 	private String securityPrincipal;
 	private String providerUrl;
@@ -59,6 +61,8 @@ public class LDAP_Authenticator {
 	private String ldapFilter;
 	private String ldapAttribute;
 	private Case userNameCase;
+	private String presearchSecurityPrincipal;
+	private String presearchSecurityCredentials;
 
 	@PostConstruct
 	private void init() {
@@ -103,6 +107,17 @@ public class LDAP_Authenticator {
 				ldapBase = props.getString("ldap.base");
 				ldapFilter = props.getString("ldap.filter");
 				ldapAttribute = props.getString("ldap.attribute");
+			}
+
+			if (props.has("presearch.security_principal")) {
+				if (ldapBase == null) {
+					String msg = "presearch.security_principal requires ldap.base, ldap.filter "
+							+ "and ldap.attribute to also be set";
+					logger.error(fatal, msg);
+					throw new IllegalStateException(msg);
+				}
+				presearchSecurityPrincipal = props.getString("presearch.security_principal");
+				presearchSecurityCredentials = props.getString("presearch.security_credentials");
 			}
 
 			if (props.has("case")) {
@@ -190,18 +205,55 @@ public class LDAP_Authenticator {
 
 		logger.info("Checking username/password with ldap server");
 
-		authEnv.put(Context.SECURITY_PRINCIPAL, securityPrincipal.replace("%", username));
-		authEnv.put(Context.SECURITY_CREDENTIALS, password);
-
 		try {
-			LdapContext m_ctx = new InitialLdapContext(authEnv, null);
-			if (ldapBase != null) {
+			String bindPrincipal = username;
+			Attribute mappedAttribute = null;
+			Hashtable<Object, Object> bindEnv = new Hashtable<>(authEnv);
+			if (presearchSecurityPrincipal != null) {
+				Hashtable<Object, Object> searchEnv = new Hashtable<>(authEnv);
+				searchEnv.put(Context.SECURITY_PRINCIPAL, presearchSecurityPrincipal);
+				searchEnv.put(Context.SECURITY_CREDENTIALS, presearchSecurityCredentials);
+
+				LdapContext searchCtx = new InitialLdapContext(searchEnv, null);
+				try {
+					SearchControls ctls = new SearchControls();
+					ctls.setSearchScope(SearchControls.SUBTREE_SCOPE);
+					ctls.setCountLimit(2);
+					ctls.setTimeLimit(0);
+					ctls.setReturningAttributes(new String[] { ldapAttribute });
+					NamingEnumeration<SearchResult> results = searchCtx.search(ldapBase,
+							ldapFilter.replace("%", "{0}"), new Object[] { username }, ctls);
+					try {
+						if (!results.hasMore()) {
+							throw new AuthnException(HttpURLConnection.HTTP_FORBIDDEN,
+									AUTHENTICATION_FAILED);
+						}
+						SearchResult sr = results.next();
+						if (results.hasMore()) {
+							throw new AuthnException(HttpURLConnection.HTTP_FORBIDDEN,
+									AUTHENTICATION_FAILED);
+						}
+						bindPrincipal = sr.getNameInNamespace();
+						mappedAttribute = sr.getAttributes().get(ldapAttribute);
+					} finally {
+						results.close();
+					}
+					logger.debug("security principal resolved to " + bindPrincipal + " via presearch");
+				} finally {
+					searchCtx.close();
+				}
+			}
+			bindEnv.put(Context.SECURITY_PRINCIPAL, securityPrincipal.replace("%", bindPrincipal));
+			bindEnv.put(Context.SECURITY_CREDENTIALS, password);
+
+			LdapContext m_ctx = new InitialLdapContext(bindEnv, null);
+			if (ldapBase != null && presearchSecurityPrincipal == null) {
 				SearchControls ctls = new SearchControls();
 				ctls.setSearchScope(SearchControls.SUBTREE_SCOPE);
 				ctls.setCountLimit(0);
 				ctls.setTimeLimit(0);
-				NamingEnumeration<SearchResult> results = m_ctx.search(ldapBase, ldapFilter.replace("%", username),
-						ctls);
+				NamingEnumeration<SearchResult> results = m_ctx.search(ldapBase, ldapFilter.replace("%", "{0}"),
+						new Object[] { username }, ctls);
 				if (!results.hasMoreElements()) {
 					throw new AuthnException(HttpURLConnection.HTTP_FORBIDDEN,
 							"Unable to locate user in LDAP directory.");
@@ -209,12 +261,25 @@ public class LDAP_Authenticator {
 				username = (String) results.nextElement().getAttributes().get(ldapAttribute).get();
 				logger.debug("username changed to " + username + " from ldap search");
 			}
+			m_ctx.close();
+			if (presearchSecurityPrincipal != null) {
+				if (mappedAttribute == null || mappedAttribute.size() == 0) {
+					throw new AuthnException(HttpURLConnection.HTTP_INTERNAL_ERROR,
+							"LDAP attribute " + ldapAttribute + " must have at least one value.");
+				}
+				Object value = mappedAttribute.get();
+				if (!(value instanceof String)) {
+					throw new AuthnException(HttpURLConnection.HTTP_INTERNAL_ERROR,
+							"LDAP attribute " + ldapAttribute + " must contain text values.");
+				}
+				username = (String) value;
+			}
 		} catch (AuthenticationException e) {
-			throw new AuthnException(HttpURLConnection.HTTP_FORBIDDEN, "The username and password do not match ");
+			throw new AuthnException(HttpURLConnection.HTTP_FORBIDDEN, AUTHENTICATION_FAILED);
 		} catch (NamingException e) {
 			String msg = e.getClass() + ": " + e.getMessage();
 			logger.error(msg);
-			throw new AuthnException(HttpURLConnection.HTTP_FORBIDDEN, msg);
+			throw new AuthnException(HttpURLConnection.HTTP_INTERNAL_ERROR, "LDAP authentication service error.");
 		}
 
 		if (userNameCase == Case.UPPER) {
